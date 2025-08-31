@@ -2,17 +2,15 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 
-from src.pipelines.job_apply import run_job_apply_stub
+from src.pipelines.job_apply import run_job_apply
 from src.agents.memory import Memory
 
 app = FastAPI()
-
 
 # -------------------- Health --------------------
 @app.get("/health")
 def health():
     return {"ok": True, "message": "AI-ops environment is alive!"}
-
 
 # -------------------- Memory models --------------------
 class ResumeUpsert(BaseModel):
@@ -20,7 +18,6 @@ class ResumeUpsert(BaseModel):
 
 class BrandVoiceUpsert(BaseModel):
     brand_voice: str
-
 
 # -------------------- Memory endpoints --------------------
 @app.post("/memory/resume")
@@ -51,7 +48,6 @@ def get_brand_voice():
         raise HTTPException(status_code=404, detail="No brand voice saved yet.")
     return {"brand_voice": text}
 
-
 # -------------------- Apply models --------------------
 class JobApplicationRequest(BaseModel):
     job_title: str
@@ -59,11 +55,10 @@ class JobApplicationRequest(BaseModel):
     resume_text: Optional[str] = None
     brand_voice: Optional[str] = None
 
-
 # -------------------- Apply endpoint --------------------
 @app.post("/apply")
 def apply(req: JobApplicationRequest):
-    result = run_job_apply_stub(
+    result = run_job_apply(
         job_title=req.job_title,
         job_desc=req.job_desc,
         resume_text=req.resume_text,
