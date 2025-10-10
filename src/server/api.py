@@ -9,8 +9,10 @@ from loguru import logger
 import xxhash
 from pypdf import PdfReader
 
-from src.pipelines.job_apply import run_job_apply
+# --- Import all three pipelines ---
+from src.pipelines.write_letter import run_write_letter
 from src.pipelines.rank_job import run_job_ranker
+from src.pipelines.track_job import run_job_tracker # <-- IMPORT THE NEW TRACKER
 from src.agents.memory import Memory
 
 app = FastAPI()
@@ -19,7 +21,7 @@ app = FastAPI()
 RESUME_PDF_PATH = "GabrielDalmoro_Resume_Software_2025.pdf"
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 100
-RANKING_THRESHOLD = 7.0 # <-- New: Our decision threshold
+RANKING_THRESHOLD = 7.0
 
 # -------------------- Health --------------------
 @app.get("/health")
@@ -62,42 +64,69 @@ def index_resume():
     logger.success(f"Successfully indexed {len(chunks)} chunks and saved new fingerprint.")
     return {"ok": True, "message": f"Successfully indexed new resume with {len(chunks)} chunks."}
 
+
 # -------------------- Orchestrator Endpoint --------------------
 class JobProcessRequest(BaseModel):
     job_title: str
+    company: str 
     job_desc: str
+    job_url: str = "" 
 
 @app.post("/process-job")
 def process_job_application(req: JobProcessRequest):
     """
-    This is the main orchestrator. It chains the Ranker and Tailor agents.
-    1. Ranks the job fit.
-    2. If the fit is good enough, proceeds to generate a cover letter.
-    3. Returns a full report of the process.
+    This is the main orchestrator. It chains the Ranker, Tailor, and Tracker agents.
     """
-    # Step 1: Delegate to the Ranker Agent
     logger.info(f"--- Starting Orchestrated Job Process for: {req.job_title} ---")
+    
+    # Step 1: Delegate to the Ranker Agent
     ranking_result = run_job_ranker(job_title=req.job_title, job_desc=req.job_desc)
     fit_score = ranking_result.get("fit_score", 0.0)
 
     # Step 2: Make a Decision
     if fit_score < RANKING_THRESHOLD:
-        logger.warning(f"Job ranked {fit_score}, which is below the threshold of {RANKING_THRESHOLD}. Halting process.")
-        return {
-            "status": "skipped",
-            "ranking": ranking_result,
-            "message": "Job fit was too low to proceed with application."
-        }
+        logger.warning(f"Job ranked {fit_score}, which is below the threshold. Halting process.")
+        # Even if we halt, we can still track the lead as "Skipped"
+        run_job_tracker(
+            job_title=req.job_title,
+            company=req.company,
+            job_url=req.job_url,
+            status="Skipped",
+            fit_score=fit_score,
+            reason=ranking_result.get("reason", ""),
+            cover_letter_text="N/A - Job fit score was too low."
+        )
+        return {"status": "skipped", "ranking": ranking_result, "message": "Job fit too low. Logged to Notion as 'Skipped'."}
     
     logger.success(f"Job ranked {fit_score}, proceeding to tailor application.")
 
     # Step 3: Delegate to the Tailor Agent
-    application_result = run_job_apply(job_title=req.job_title, job_desc=req.job_desc)
+    # We need to read the generated cover letter from the file to pass it to the tracker
+    application_result = run_write_letter(job_title=req.job_title, job_desc=req.job_desc)
+    cover_letter_path_str = application_result.get("artifacts", {}).get("cover_letter_path")
+    
+    cover_letter_text = "Error: Could not read cover letter file."
+    if cover_letter_path_str:
+        try:
+            cover_letter_text = Path(cover_letter_path_str).read_text()
+        except Exception as e:
+            logger.error(f"Failed to read cover letter file at {cover_letter_path_str}: {e}")
 
-    # Step 4: Return a full report
+    # Step 4: Delegate to the Tracker Agent
+    notion_page_id = run_job_tracker(
+        job_title=req.job_title,
+        company=req.company,
+        job_url=req.job_url,
+        status="Written Letter",
+        fit_score=fit_score,
+        reason=ranking_result.get("reason", ""),
+        cover_letter_text=cover_letter_text
+    )
+
+    # Step 5: Return a full report
     return {
         "status": "processed",
         "ranking": ranking_result,
-        "application_artifacts": application_result.get("artifacts"),
-        "message": "Job processed successfully."
+        "notion_page_id": notion_page_id,
+        "message": "Job processed successfully and logged to Notion."
     }

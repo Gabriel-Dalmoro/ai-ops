@@ -44,7 +44,6 @@ class LLM:
             self.model_name = os.getenv("GEMINI_MODEL_NAME", "gemini-1.5-flash-latest")
             
             genai.configure(api_key=self.api_key)
-            logger.info(f"Gemini backend configured with model: {self.model_name}")
 
     def generate(self, prompt: str) -> str:
         safe_prompt = truncate_by_tokens(prompt, self.max_prompt_tokens)
