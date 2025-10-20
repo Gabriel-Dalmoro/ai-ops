@@ -1,66 +1,100 @@
 from loguru import logger
 from playwright.sync_api import sync_playwright
+from playwright_stealth import stealth_sync 
 import os
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 
-#TODO Have to completely revamp and update the scrapper method and ideaa
-
+# --- UPDATED: Selector Configuration Based on Screenshots ---
+SITE_SELECTORS = {
+    "fr.indeed.com": { # Assuming French Indeed based on screenshots
+        "job_title": "h1.jobsearch-JobInfoHeader-title",
+        "company": "div[data-testid='jobsearch-CompanyInfoContainer']",
+        "description_container": "#jobDescriptionText",
+    },
+    # Add other Indeed domains if needed (e.g., "www.indeed.com")
+    # "www.indeed.com": { ... } 
+    
+    # --- Commenting out non-functional LinkedIn selectors ---
+    # "www.linkedin.com": {
+    #     "job_title": '[class*="job-details-jobs-unified-top-card__job-title"]', # Non-functional
+    #     "company": '[class*="job-details-jobs-unified-top-card__primary-description-container"]', # Non-functional
+    #     "description_container": "#job-details", # Non-functional
+    # },
+}
 
 def run_url_scraper(job_url: str) -> dict | None:
     """
-    An advanced scraper using Playwright to handle dynamic, login-protected sites.
-    It mimics human interaction by clicking "Show more" and uses robust selectors.
+    Scrapes a job posting URL using Playwright with stealth settings.
+    Uses site-specific selectors based on inspected HTML. Includes Cloudflare mitigation.
     """
-    logger.info(f"--- Starting ADVANCED Scraper Agent for URL: {job_url} ---")
+    logger.info(f"--- Starting STEALTH Scraper Agent for URL: {job_url} ---")
     
-    li_at_cookie = os.getenv("LINKEDIN_LI_AT_COOKIE")
-    if not li_at_cookie:
-        logger.error("LINKEDIN_LI_AT_COOKIE not found. Cannot log in.")
+    try:
+        hostname = urlparse(job_url).hostname
+        if not hostname or hostname not in SITE_SELECTORS:
+            logger.error(f"Scraper not configured for hostname: {hostname}. Check SITE_SELECTORS.")
+            return None
+        
+        selectors = SITE_SELECTORS[hostname]
+        logger.info(f"Using scraper configuration for: {hostname}")
+
+    except Exception as e:
+        logger.error(f"URL parsing/Selector lookup error: {e}")
         return None
 
     with sync_playwright() as p:
+        browser = None # Define browser outside try block for closing in finally
         try:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(headless=True) 
             context = browser.new_context()
-            context.add_cookies([{"name": "li_at", "value": li_at_cookie, "domain": ".linkedin.com", "path": "/"}])
-
+            
+            # --- Apply Stealth ---
+            stealth_sync(context)
+            logger.info("Applied stealth settings to browser context.")
+            
             page = context.new_page()
-            page.goto(job_url, wait_until="domcontentloaded", timeout=20000)
-
-            # --- NEW: INTERACTIVE LOGIC ---
             
-            # 1. Wait for the top card to be generally visible
-            # This is a more stable landmark to wait for.
-            top_card_selector = ".job-details-jobs-unified-top-card__content--two-pane"
-            page.wait_for_selector(top_card_selector, timeout=15000)
-            logger.info("Job top card is visible.")
+            logger.info(f"Navigating to {job_url}...")
+            # Increased timeout and wait_until might help with Cloudflare
+            page.goto(job_url, wait_until="networkidle", timeout=60000) 
+            logger.info("Page loaded. Checking for Cloudflare (basic check)...")
 
-            # 2. Click the "Show more" button to expand the description
-            show_more_button_selector = ".jobs-description__footer-button"
-            page.click(show_more_button_selector)
-            logger.info("Clicked 'Show more' button to expand description.")
+            # Basic Cloudflare check (might need more advanced checks later)
+            if page.title() == "Just a moment...":
+                logger.warning("Cloudflare challenge detected. Waiting might help...")
+                # Playwright might handle simple challenges automatically with stealth
+                # Wait for navigation or a known element after challenge
+                page.wait_for_load_state("networkidle", timeout=30000) 
+                if page.title() == "Just a moment...":
+                     logger.error("Cloudflare challenge persistent. Scraping likely failed.")
+                     raise Exception("Cloudflare challenge blocked access.")
+                else:
+                    logger.info("Potentially bypassed Cloudflare challenge.")
 
-            # --- NEW: ROBUST SELECTOR LOGIC ---
+            # --- Use ACTUAL Indeed Selectors ---
+            description_selector = selectors["description_container"]
+            logger.info(f"Waiting for description selector: '{description_selector}'")
+            page.wait_for_selector(description_selector, timeout=20000) 
+            logger.info("Description container found.")
+
+            job_title = page.locator(selectors["job_title"]).inner_text(timeout=5000)
+            logger.info(f"Extracted Job Title: '{job_title}'")
             
-            # Since classes are dynamic, we find elements by their role and position.
-            # This finds the main h1, which is almost always the job title.
-            job_title = page.locator(f"{top_card_selector} h1").inner_text()
-            
-            # This finds the container with company name, location, etc., and we take the first line.
-            company_info_text = page.locator(f"{top_card_selector} .job-details-jobs-unified-top-card__primary-description-container").inner_text()
-            company_name = company_info_text.split('·')[0].strip()
+            company_info_locator = page.locator(selectors["company"])
+            # Extract text carefully, handling potential sub-elements
+            company_name = company_info_locator.locator('div[data-testid="jobsearch-CompanyReview--heading"]').inner_text(timeout=5000)
+            # Add more specific locators if needed based on structure inside company container
+            logger.info(f"Extracted Company Name: '{company_name}'")
 
-            # The main description container.
-            description_container_selector = ".jobs-box__html-content"
-            page.wait_for_selector(description_container_selector, timeout=5000)
-            job_desc_html = page.locator(description_container_selector).inner_html()
+            job_desc_html = page.locator(description_selector).inner_html(timeout=5000)
+            logger.info("Extracted description HTML.")
             
             soup = BeautifulSoup(job_desc_html, "html.parser")
-            job_desc_text = soup.get_text(separator="\n").strip()
+            job_desc_text = soup.get_text(separator="\n", strip=True)
+            logger.info(f"Extracted description text (length: {len(job_desc_text)}). Preview: '{job_desc_text[:100]}...'")
 
             logger.success(f"Successfully extracted job: '{job_title}' at '{company_name}'")
-            browser.close()
             
             return {
                 "job_title": job_title,
@@ -70,10 +104,12 @@ def run_url_scraper(job_url: str) -> dict | None:
             }
 
         except Exception as e:
-            logger.error(f"Playwright failed to scrape the URL '{job_url}': {e}")
-            if 'browser' in locals():
-                browser.close()
+            logger.error(f"Playwright operation failed for URL '{job_url}': {e}")
             return None
+        finally:
+             if browser:
+                  browser.close()
+                  logger.info("Browser closed.")
 
 # from loguru import logger
 # from playwright.sync_api import sync_playwright
