@@ -1,6 +1,6 @@
 from loguru import logger
 from playwright.sync_api import sync_playwright
-from playwright_stealth import stealth_sync 
+from playwright_stealth import stealth
 import os
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
@@ -50,7 +50,7 @@ def run_url_scraper(job_url: str) -> dict | None:
             context = browser.new_context()
             
             # --- Apply Stealth ---
-            stealth_sync(context)
+            stealth(context)
             logger.info("Applied stealth settings to browser context.")
             
             page = context.new_page()
