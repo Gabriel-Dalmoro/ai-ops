@@ -1,205 +1,182 @@
 from loguru import logger
 from playwright.sync_api import sync_playwright
-from playwright_stealth import stealth
 import os
+import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
 
-# --- UPDATED: Selector Configuration Based on Screenshots ---
+# --- UPDATED: Selectors based *only* on the latest screenshots ---
 SITE_SELECTORS = {
-    "fr.indeed.com": { # Assuming French Indeed based on screenshots
+    "fr.indeed.com": {
+        "job_title": "h1.jobsearch-JobInfoHeader-title",
+        "company": "div[data-testid='jobsearch-CompanyInfoContainer']",
+        "description_container": "#jobDescriptionText", 
+    },
+    # Add generic Indeed selectors as fallback
+    "indeed.com": {
         "job_title": "h1.jobsearch-JobInfoHeader-title",
         "company": "div[data-testid='jobsearch-CompanyInfoContainer']",
         "description_container": "#jobDescriptionText",
-    },
-    # Add other Indeed domains if needed (e.g., "www.indeed.com")
-    # "www.indeed.com": { ... } 
-    
-    # --- Commenting out non-functional LinkedIn selectors ---
-    # "www.linkedin.com": {
-    #     "job_title": '[class*="job-details-jobs-unified-top-card__job-title"]', # Non-functional
-    #     "company": '[class*="job-details-jobs-unified-top-card__primary-description-container"]', # Non-functional
-    #     "description_container": "#job-details", # Non-functional
-    # },
+    }
 }
+
+class ScraperAPIClient:
+    """
+    A generic client for Scraper APIs (like ZenRows, ScraperAPI, ScrapingAnt).
+    Most of these APIs work by sending the target URL as a parameter to their endpoint.
+    """
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        # Default to a generic proxy-style API structure (compatible with ScraperAPI/ZenRows via params)
+        # Users can override this if they have a specific provider preference in the future
+        self.api_url = "https://api.scraperapi.com" 
+        # Note: ZenRows uses 'https://api.zenrows.com/v1/'
+        # We will try to detect or default to ScraperAPI for now as it's a common standard,
+        # but this logic can be easily swapped.
+        
+        # If the key looks like a ZenRows key (usually starts with specific chars or user config), we could switch.
+        # For now, we'll assume the user might set SCRAPER_API_URL if they use a different provider.
+        self.api_endpoint = os.getenv("SCRAPER_API_URL", "https://api.scraperapi.com")
+
+    def scrape(self, target_url: str) -> str | None:
+        """
+        Fetches the HTML of the target URL using the scraping API.
+        """
+        params = {
+            "api_key": self.api_key,
+            "url": target_url,
+            "render": "true", # Request JS rendering
+            "premium": "true", # Required for Indeed on ScraperAPI
+            "country_code": "fr", # Helpful for fr.indeed.com
+        }
+        
+        # ZenRows specific params adjustment if detected (naive check)
+        if "zenrows" in self.api_endpoint:
+             params = {
+                "apikey": self.api_key,
+                "url": target_url,
+                "js_render": "true",
+                "premium_proxy": "true",
+                "location": "fr",
+            }
+
+        try:
+            logger.info(f"Calling Scraper API ({self.api_endpoint}) for {target_url}...")
+            response = requests.get(self.api_endpoint, params=params, timeout=60)
+            
+            if response.status_code == 200:
+                logger.success("Scraper API request successful.")
+                return response.text
+            elif response.status_code == 403:
+                logger.error("Scraper API Key invalid or quota exceeded.")
+            else:
+                logger.error(f"Scraper API failed with status {response.status_code}: {response.text}")
+                
+        except Exception as e:
+            logger.error(f"Error calling Scraper API: {e}")
+            
+        return None
+
+def _extract_from_html(html_content: str, job_url: str) -> dict | None:
+    """
+    Parses raw HTML (from API or fallback) to extract job details.
+    """
+    soup = BeautifulSoup(html_content, "html.parser")
+    hostname = urlparse(job_url).hostname
+    
+    # Normalize hostname for selector lookup
+    selectors = SITE_SELECTORS.get(hostname)
+    if not selectors:
+        # Try to find a matching key (e.g., 'indeed.com' for 'fr.indeed.com')
+        for site, sel in SITE_SELECTORS.items():
+            if site in hostname:
+                selectors = sel
+                break
+    
+    if not selectors:
+        logger.warning(f"No specific selectors found for {hostname}, trying generic fallback.")
+        # Generic fallback (could be improved)
+        selectors = SITE_SELECTORS["indeed.com"]
+
+    try:
+        # 1. Job Title
+        title_tag = soup.select_one(selectors["job_title"])
+        job_title = title_tag.get_text(strip=True) if title_tag else "Unknown Job Title"
+        
+        # 2. Company
+        company_tag = soup.select_one(selectors["company"])
+        company = company_tag.get_text(strip=True) if company_tag else "Unknown Company"
+        
+        # 3. Description
+        desc_tag = soup.select_one(selectors["description_container"])
+        if desc_tag:
+            # Get text with newlines for readability
+            job_desc = desc_tag.get_text(separator="\n", strip=True)
+        else:
+            job_desc = "Description not found."
+            
+        logger.info(f"Extracted: {job_title} at {company}")
+        
+        return {
+            "job_title": job_title,
+            "company": company,
+            "job_desc": job_desc,
+            "job_url": job_url,
+        }
+
+    except Exception as e:
+        logger.error(f"Error parsing HTML content: {e}")
+        return None
+
 
 def run_url_scraper(job_url: str) -> dict | None:
     """
-    Scrapes a job posting URL using Playwright with stealth settings.
-    Uses site-specific selectors based on inspected HTML. Includes Cloudflare mitigation.
+    Scrapes a job posting URL.
+    Prioritizes Scraper API if configured, otherwise falls back to local Playwright.
     """
-    logger.info(f"--- Starting STEALTH Scraper Agent for URL: {job_url} ---")
+    logger.info(f"--- Starting Scraper Agent for URL: {job_url} ---")
     
+    # 1. Try Scraper API
+    api_key = os.getenv("SCRAPER_API_KEY")
+    if api_key:
+        logger.info("SCRAPER_API_KEY found. Using Scraper API.")
+        client = ScraperAPIClient(api_key)
+        html_content = client.scrape(job_url)
+        if html_content:
+            return _extract_from_html(html_content, job_url)
+        else:
+            logger.warning("Scraper API failed. Falling back to local Playwright...")
+    else:
+        logger.info("No SCRAPER_API_KEY found. Using local Playwright.")
+
+    # 2. Local Playwright Fallback
     try:
         hostname = urlparse(job_url).hostname
-        if not hostname or hostname not in SITE_SELECTORS:
-            logger.error(f"Scraper not configured for hostname: {hostname}. Check SITE_SELECTORS.")
-            return None
+        # ... (Existing Playwright logic could go here, but for brevity and reliability, 
+        # we might want to just return None if the API fails and we know local is blocked.
+        # However, keeping a stripped down version is good for non-blocked sites.)
         
-        selectors = SITE_SELECTORS[hostname]
-        logger.info(f"Using scraper configuration for: {hostname}")
+        if not hostname: 
+            return None
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            
+            logger.info(f"Navigating to {job_url} (Local)...")
+            page.goto(job_url, wait_until="domcontentloaded", timeout=30000)
+            
+            # Basic Cloudflare check
+            if "Just a moment" in page.title():
+                logger.error("Cloudflare challenge detected locally. Scraper API is recommended.")
+                browser.close()
+                return None
+                
+            content = page.content()
+            browser.close()
+            
+            return _extract_from_html(content, job_url)
 
     except Exception as e:
-        logger.error(f"URL parsing/Selector lookup error: {e}")
+        logger.error(f"Local Playwright scraper failed: {e}")
         return None
-
-    with sync_playwright() as p:
-        browser = None # Define browser outside try block for closing in finally
-        try:
-            browser = p.chromium.launch(headless=True) 
-            context = browser.new_context()
-            
-            # --- Apply Stealth ---
-            stealth(context)
-            logger.info("Applied stealth settings to browser context.")
-            
-            page = context.new_page()
-            
-            logger.info(f"Navigating to {job_url}...")
-            # Increased timeout and wait_until might help with Cloudflare
-            page.goto(job_url, wait_until="networkidle", timeout=60000) 
-            logger.info("Page loaded. Checking for Cloudflare (basic check)...")
-
-            # Basic Cloudflare check (might need more advanced checks later)
-            if page.title() == "Just a moment...":
-                logger.warning("Cloudflare challenge detected. Waiting might help...")
-                # Playwright might handle simple challenges automatically with stealth
-                # Wait for navigation or a known element after challenge
-                page.wait_for_load_state("networkidle", timeout=30000) 
-                if page.title() == "Just a moment...":
-                     logger.error("Cloudflare challenge persistent. Scraping likely failed.")
-                     raise Exception("Cloudflare challenge blocked access.")
-                else:
-                    logger.info("Potentially bypassed Cloudflare challenge.")
-
-            # --- Use ACTUAL Indeed Selectors ---
-            description_selector = selectors["description_container"]
-            logger.info(f"Waiting for description selector: '{description_selector}'")
-            page.wait_for_selector(description_selector, timeout=20000) 
-            logger.info("Description container found.")
-
-            job_title = page.locator(selectors["job_title"]).inner_text(timeout=5000)
-            logger.info(f"Extracted Job Title: '{job_title}'")
-            
-            company_info_locator = page.locator(selectors["company"])
-            # Extract text carefully, handling potential sub-elements
-            company_name = company_info_locator.locator('div[data-testid="jobsearch-CompanyReview--heading"]').inner_text(timeout=5000)
-            # Add more specific locators if needed based on structure inside company container
-            logger.info(f"Extracted Company Name: '{company_name}'")
-
-            job_desc_html = page.locator(description_selector).inner_html(timeout=5000)
-            logger.info("Extracted description HTML.")
-            
-            soup = BeautifulSoup(job_desc_html, "html.parser")
-            job_desc_text = soup.get_text(separator="\n", strip=True)
-            logger.info(f"Extracted description text (length: {len(job_desc_text)}). Preview: '{job_desc_text[:100]}...'")
-
-            logger.success(f"Successfully extracted job: '{job_title}' at '{company_name}'")
-            
-            return {
-                "job_title": job_title,
-                "company": company_name,
-                "job_desc": job_desc_text,
-                "job_url": job_url,
-            }
-
-        except Exception as e:
-            logger.error(f"Playwright operation failed for URL '{job_url}': {e}")
-            return None
-        finally:
-             if browser:
-                  browser.close()
-                  logger.info("Browser closed.")
-
-# from loguru import logger
-# from playwright.sync_api import sync_playwright
-# import os
-# from bs4 import BeautifulSoup
-# from urllib.parse import urlparse
-
-# # --- NEW: Professional-grade Selector Configuration ---
-# # This is our library of site-specific instructions.
-# # Adding a new site is as easy as adding a new entry here.
-# SITE_SELECTORS = {
-#       "www.linkedin.com": {
-#         "job_title": '[class*="job-details-jobs-unified-top-card__job-title"]',
-#         "company": '[class*="job-details-jobs-unified-top-card__primary-description-container"]',
-#         "description_container": "#job-details",
-#     },
-#     # EXAMPLE: How you would add another site in the future
-#     # "ca.indeed.com": {
-#     #     "job_title": ".jobsearch-JobInfoHeader-title",
-#     #     "company": "[data-testid='jobsearch-CompanyInfoContainer']",
-#     #     "description_container": "#jobDescriptionText",
-#     # }
-# }
-
-# def run_url_scraper(job_url: str) -> dict | None:
-#     """
-#     Scrapes a job posting URL using a headless browser (Playwright).
-#     It uses a configuration object to find the correct CSS selectors
-#     for different job board websites, making it extensible.
-#     """
-#     logger.info(f"--- Starting Playwright Scraper Agent for URL: {job_url} ---")
-    
-#     li_at_cookie = os.getenv("LINKEDIN_LI_AT_COOKIE")
-#     if not li_at_cookie:
-#         logger.error("LINKEDIN_LI_AT_COOKIE not found. Cannot log in for scraping.")
-#         return None
-
-#     # --- NEW: Determine which site we're scraping ---
-#     try:
-#         hostname = urlparse(job_url).hostname
-#         if not hostname or hostname not in SITE_SELECTORS:
-#             logger.error(f"Scraper not configured for hostname: {hostname}. Aborting.")
-#             return None
-        
-#         selectors = SITE_SELECTORS[hostname]
-#         logger.info(f"Using scraper configuration for: {hostname}")
-
-#     except Exception as e:
-#         logger.error(f"Could not parse URL or find selectors: {e}")
-#         return None
-
-#     with sync_playwright() as p:
-#         try:
-#             browser = p.chromium.launch(headless=True)
-#             context = browser.new_context()
-            
-#             # Add authentication cookie - essential for LinkedIn
-#             context.add_cookies([{
-#                 "name": "li_at", "value": li_at_cookie,
-#                 "domain": ".linkedin.com", "path": "/"
-#             }])
-
-#             page = context.new_page()
-#             page.goto(job_url, wait_until="domcontentloaded", timeout=20000)
-            
-#             # Use the specific selector for the description to wait for the page to load
-#             description_selector = selectors["description_container"]
-#             page.wait_for_selector(description_selector, timeout=15000)
-
-#             # --- UPDATED: Use selectors from our config object ---
-#             job_title = page.locator(selectors["job_title"]).inner_text()
-#             company_name = page.locator(selectors["company"]).inner_text()
-#             job_desc_html = page.locator(description_selector).inner_html()
-            
-#             # Clean the HTML to plain text for the LLM
-#             soup = BeautifulSoup(job_desc_html, "html.parser")
-#             job_desc_text = soup.get_text(separator="\n").strip()
-
-#             logger.success(f"Successfully extracted job: '{job_title}' at '{company_name}'")
-#             browser.close()
-            
-#             return {
-#                 "job_title": job_title,
-#                 "company": company_name,
-#                 "job_desc": job_desc_text,
-#                 "job_url": job_url,
-#             }
-
-#         except Exception as e:
-#             logger.error(f"Playwright failed to scrape the URL '{job_url}': {e}")
-#             if 'browser' in locals():
-#                 browser.close()
-#             return None
