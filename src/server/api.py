@@ -83,8 +83,14 @@ def process_job_from_url(req: URLProcessRequest):
     """
     # Step 1: Delegate to the Scraper Agent
     scraped_data = run_url_scraper(req.job_url)
-    if not scraped_data:
-        raise HTTPException(status_code=400, detail="Failed to scrape job details from the provided URL.")
+    
+    # --- VALIDATION ---
+    if not scraped_data or not scraped_data.get("job_desc"):
+        logger.error("Scraper returned invalid data (missing description). Halting pipeline.")
+        raise HTTPException(
+            status_code=400, 
+            detail="Failed to extract valid job details. The URL might be a search page or blocked."
+        )
     
     # Step 2: Call the existing job processing logic with the scraped data
     return process_job_application(JobProcessRequest(**scraped_data))

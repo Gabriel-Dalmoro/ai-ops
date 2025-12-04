@@ -4,6 +4,7 @@ import os
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urlencode
+from apify_client import ApifyClient
 
 # --- UPDATED: Selectors based *only* on the latest screenshots ---
 SITE_SELECTORS = {
@@ -20,66 +21,71 @@ SITE_SELECTORS = {
     }
 }
 
-class ScraperAPIClient:
+def run_apify_scraper(job_url: str) -> dict | None:
     """
-    A generic client for Scraper APIs (like ZenRows, ScraperAPI, ScrapingAnt).
-    Most of these APIs work by sending the target URL as a parameter to their endpoint.
+    Uses the Apify 'misery/indeed-scraper' Actor to scrape the job.
     """
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        # Default to a generic proxy-style API structure (compatible with ScraperAPI/ZenRows via params)
-        # Users can override this if they have a specific provider preference in the future
-        self.api_url = "https://api.scraperapi.com" 
-        # Note: ZenRows uses 'https://api.zenrows.com/v1/'
-        # We will try to detect or default to ScraperAPI for now as it's a common standard,
-        # but this logic can be easily swapped.
-        
-        # If the key looks like a ZenRows key (usually starts with specific chars or user config), we could switch.
-        # For now, we'll assume the user might set SCRAPER_API_URL if they use a different provider.
-        self.api_endpoint = os.getenv("SCRAPER_API_URL", "https://api.scraperapi.com")
+    api_token = os.getenv("APIFY_API_TOKEN")
+    if not api_token:
+        logger.warning("APIFY_API_TOKEN not found. Skipping Apify.")
+        return None
 
-    def scrape(self, target_url: str) -> str | None:
-        """
-        Fetches the HTML of the target URL using the scraping API.
-        """
-        params = {
-            "api_key": self.api_key,
-            "url": target_url,
-            "render": "true", # Request JS rendering
-            "premium": "true", # Required for Indeed on ScraperAPI
-            "country_code": "fr", # Helpful for fr.indeed.com
+    try:
+        logger.info(f"Starting Apify Actor for {job_url}...")
+        client = ApifyClient(api_token)
+        
+        # Prepare the Actor input
+        run_input = {
+            "startUrls": [{"url": job_url}],
+            "maxItems": 1,
         }
         
-        # ZenRows specific params adjustment if detected (naive check)
-        if "zenrows" in self.api_endpoint:
-             params = {
-                "apikey": self.api_key,
-                "url": target_url,
-                "js_render": "true",
-                "premium_proxy": "true",
-                "location": "fr",
-            }
+        # Run the Actor and wait for it to finish
+        # Actor: misery/indeed-scraper (h7sQ4K5p2) - Free/Cheap and reliable
+        run = client.actor("h7sQ4K5p2").call(run_input=run_input)
+        
+        # Fetch results from the dataset
+        logger.info(f"Actor run finished. Fetching results from dataset {run['defaultDatasetId']}...")
+        dataset_items = client.dataset(run["defaultDatasetId"]).list_items().items
+        
+        if not dataset_items:
+            logger.warning("Apify Actor returned no items.")
+            return None
+            
+        item = dataset_items[0]
+        
+        # Map Apify output to our format
+        # Note: The 'misery/indeed-scraper' output schema might vary, so we use .get() safely
+        job_title = item.get("positionName") or item.get("jobTitle") or "Unknown Job Title"
+        company = item.get("company") or "Unknown Company"
+        # Some actors return 'description' or 'jobDescription'
+        job_desc = item.get("description") or item.get("jobDescription") or ""
+        
+        # --- VALIDATION ---
+        if job_title == "Unknown Job Title":
+             logger.warning("Apify: Job title missing. Marking as failed.")
+             return None
 
-        try:
-            logger.info(f"Calling Scraper API ({self.api_endpoint}) for {target_url}...")
-            response = requests.get(self.api_endpoint, params=params, timeout=60)
-            
-            if response.status_code == 200:
-                logger.success("Scraper API request successful.")
-                return response.text
-            elif response.status_code == 403:
-                logger.error("Scraper API Key invalid or quota exceeded.")
-            else:
-                logger.error(f"Scraper API failed with status {response.status_code}: {response.text}")
-                
-        except Exception as e:
-            logger.error(f"Error calling Scraper API: {e}")
-            
+        if not job_desc or len(job_desc) < 50:
+            logger.warning(f"Apify: Job description missing or too short ({len(job_desc)} chars). Marking as failed.")
+            return None
+
+        logger.success(f"Apify Success: {job_title} at {company}")
+        
+        return {
+            "job_title": job_title,
+            "company": company,
+            "job_desc": job_desc,
+            "job_url": job_url,
+        }
+
+    except Exception as e:
+        logger.error(f"Apify scraper failed: {e}")
         return None
 
 def _extract_from_html(html_content: str, job_url: str) -> dict | None:
     """
-    Parses raw HTML (from API or fallback) to extract job details.
+    Parses raw HTML (from fallback) to extract job details.
     """
     soup = BeautifulSoup(html_content, "html.parser")
     hostname = urlparse(job_url).hostname
@@ -113,8 +119,17 @@ def _extract_from_html(html_content: str, job_url: str) -> dict | None:
             # Get text with newlines for readability
             job_desc = desc_tag.get_text(separator="\n", strip=True)
         else:
-            job_desc = "Description not found."
+            job_desc = ""
             
+        # --- VALIDATION ---
+        if job_title == "Unknown Job Title":
+             logger.warning("Job title could not be extracted. Likely a search page or blocked. Marking as failed.")
+             return None
+
+        if not job_desc or len(job_desc) < 50:
+            logger.warning(f"Job description missing or too short ({len(job_desc)} chars). Marking as failed.")
+            return None
+
         logger.info(f"Extracted: {job_title} at {company}")
         
         return {
@@ -132,29 +147,24 @@ def _extract_from_html(html_content: str, job_url: str) -> dict | None:
 def run_url_scraper(job_url: str) -> dict | None:
     """
     Scrapes a job posting URL.
-    Prioritizes Scraper API if configured, otherwise falls back to local Playwright.
+    Prioritizes Apify if configured, otherwise falls back to local Playwright.
     """
     logger.info(f"--- Starting Scraper Agent for URL: {job_url} ---")
     
-    # 1. Try Scraper API
-    api_key = os.getenv("SCRAPER_API_KEY")
-    if api_key:
-        logger.info("SCRAPER_API_KEY found. Using Scraper API.")
-        client = ScraperAPIClient(api_key)
-        html_content = client.scrape(job_url)
-        if html_content:
-            return _extract_from_html(html_content, job_url)
+    # 1. Try Apify
+    if os.getenv("APIFY_API_TOKEN"):
+        logger.info("APIFY_API_TOKEN found. Using Apify.")
+        result = run_apify_scraper(job_url)
+        if result:
+            return result
         else:
-            logger.warning("Scraper API failed. Falling back to local Playwright...")
+            logger.warning("Apify failed. Falling back to local Playwright...")
     else:
-        logger.info("No SCRAPER_API_KEY found. Using local Playwright.")
+        logger.info("No APIFY_API_TOKEN found. Using local Playwright.")
 
     # 2. Local Playwright Fallback
     try:
         hostname = urlparse(job_url).hostname
-        # ... (Existing Playwright logic could go here, but for brevity and reliability, 
-        # we might want to just return None if the API fails and we know local is blocked.
-        # However, keeping a stripped down version is good for non-blocked sites.)
         
         if not hostname: 
             return None
@@ -168,7 +178,7 @@ def run_url_scraper(job_url: str) -> dict | None:
             
             # Basic Cloudflare check
             if "Just a moment" in page.title():
-                logger.error("Cloudflare challenge detected locally. Scraper API is recommended.")
+                logger.error("Cloudflare challenge detected locally. Apify is recommended.")
                 browser.close()
                 return None
                 
